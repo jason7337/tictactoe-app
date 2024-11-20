@@ -6,7 +6,6 @@ class AsmHandler {
 
   static Future<String> getAsmCode() async {
     if (_asmCode != null) return _asmCode!;
-
     try {
       _asmCode = await rootBundle.loadString(asmPath);
       return _asmCode!;
@@ -20,110 +19,126 @@ class AsmHandler {
   static List<int> parseAsmToBytes(String asmCode) {
     List<int> bytes = [];
     Map<String, int> labels = {};
-    List<String> lines = asmCode.split('\n');
+    Map<String, List<int>> data = {};
+    int currentAddress = 0x100;
 
-    // Primera pasada: recolectar etiquetas y sus direcciones
-    int currentAddress = 0x100; // Comenzamos en 0x100 como el org 100h
-    for (String line in lines) {
+    // Primera pasada: recolectar etiquetas y datos
+    List<String> lines = asmCode.split('\n');
+    for (var line in lines) {
       line = line.trim();
+
       if (line.isEmpty || line.startsWith(';')) continue;
 
-      // Procesar etiquetas
-      if (line.endsWith(':')) {
-        String label = line.substring(0, line.length - 1).trim();
-        labels[label] = currentAddress;
-        continue;
-      }
+      try {
+        if (line.endsWith(':')) {
+          String label = line.substring(0, line.length - 1).trim();
+          labels[label] = currentAddress;
+        } else if (line.contains(' DB ')) {
+          var parts = line.split(' DB ');
+          String label = parts[0].trim();
+          String content = parts[1].trim();
 
-      // Calcular tamaño de instrucción
-      if (line.startsWith('DB ')) {
-        currentAddress += 1;
-      } else if (line.startsWith('MOV ')) {
-        currentAddress += 2; // Simplificado, realmente depende de los operandos
-      } else if (line.startsWith('INT ')) {
-        currentAddress += 2;
-      } else if (line.startsWith('JMP ') ||
-          line.startsWith('JE ') ||
-          line.startsWith('JNE ') ||
-          line.startsWith('JA ')) {
-        currentAddress += 2;
-      } else {
-        currentAddress += 1; // Para otras instrucciones
+          List<int> bytes = [];
+
+          // Manejar múltiples líneas de datos
+          if (content.startsWith("'")) {
+            String str = content.substring(1, content.indexOf("'", 1));
+            bytes.addAll(str.codeUnits);
+
+            // Agregar CR/LF si está especificado
+            if (content.contains('13,10')) {
+              bytes.addAll([13, 10]);
+            }
+
+            // Agregar terminador $ si está presente
+            if (content.contains(r"'\$'") || content.endsWith(r"'$'")) {
+              bytes.add(36); // ASCII de $
+            }
+          } else {
+            var numbers = content.split(',');
+            for (var num in numbers) {
+              num = num.trim();
+              if (num.isNotEmpty) {
+                bytes.add(int.parse(num));
+              }
+            }
+          }
+
+          data[label] = bytes;
+          labels[label] = currentAddress;
+          currentAddress += bytes.length;
+        } else if (line.startsWith('MOV ')) {
+          currentAddress += 3;
+        } else if (line.startsWith('INT ') || line.startsWith('JMP ')) {
+          currentAddress += 2;
+        } else if (line.startsWith('CALL ')) {
+          currentAddress += 3;
+        } else if (line == 'RET') {
+          currentAddress += 1;
+        }
+      } catch (e) {
+        print('Error en primera pasada, línea: $line');
+        print('Error: $e');
       }
     }
 
-    // Segunda pasada: generar código máquina
+    // Segunda pasada: generar código
     currentAddress = 0x100;
-    for (String line in lines) {
+    for (var line in lines) {
       line = line.trim();
       if (line.isEmpty || line.startsWith(';') || line.endsWith(':')) continue;
 
-      // Procesar directivas e instrucciones
-      if (line.startsWith('DB ')) {
-        // Procesar definición de bytes
-        String data = line.substring(3).trim();
-        if (data.startsWith("'") && data.endsWith("'")) {
-          // String literal
-          String str = data.substring(1, data.length - 1);
-          bytes.addAll(str.codeUnits);
-          bytes.add(0x24); // Agregar el carácter '$' al final
-        } else {
-          // Número
-          bytes.add(int.parse(data));
+      try {
+        if (line.startsWith('MOV ')) {
+          var parts = line.split(',');
+          var dest = parts[0].substring(4).trim();
+          var source = parts[1].trim();
+
+          if (dest == 'AH') {
+            bytes.add(0xB4);
+            if (source == '09h') {
+              bytes.add(0x09);
+            } else if (source == '01h') {
+              bytes.add(0x01);
+            } else if (source == '02h') {
+              bytes.add(0x02);
+            } else {
+              bytes.add(int.parse(source.replaceAll('h', ''), radix: 16));
+            }
+          } else if (dest == 'DX' && source.startsWith('OFFSET ')) {
+            bytes.add(0xBA);
+            String label = source.replaceAll('OFFSET ', '').trim();
+            int address = labels[label] ?? 0;
+            bytes.add(address & 0xFF);
+            bytes.add((address >> 8) & 0xFF);
+          }
+        } else if (line.startsWith('INT ')) {
+          bytes.add(0xCD);
+          bytes.add(0x21);
+        } else if (line.startsWith('JMP ')) {
+          bytes.add(0xEB);
+          String label = line.substring(4).trim();
+          int target = labels[label] ?? currentAddress;
+          int offset = target - (currentAddress + 2);
+          bytes.add(offset & 0xFF);
+        } else if (line.startsWith('CALL ')) {
+          bytes.add(0xE8);
+          String label = line.substring(5).trim();
+          int target = labels[label] ?? currentAddress;
+          int offset = target - (currentAddress + 3);
+          bytes.add(offset & 0xFF);
+          bytes.add((offset >> 8) & 0xFF);
+        } else if (line == 'RET') {
+          bytes.add(0xC3);
         }
-      } else if (line.startsWith('MOV ')) {
-        // MOV registro, valor
-        bytes.addAll([0xB8, 0x00]); // Simplificado
-      } else if (line.startsWith('INT ')) {
-        // Interrupción
-        String value = line.substring(4).trim();
-        bytes.addAll([0xCD, int.parse(value, radix: 16)]);
-      } else if (line.startsWith('JMP ')) {
-        // Salto incondicional
-        bytes.addAll([0xEB, 0x00]); // Salto corto simplificado
-      } else if (line.contains('CMP ')) {
-        // Comparación
-        bytes.addAll([0x3C, 0x00]); // Simplificado
-      } else if (line.startsWith('JE ')) {
-        // Salto si igual
-        bytes.addAll([0x74, 0x00]);
-      } else if (line.startsWith('JNE ')) {
-        // Salto si no igual
-        bytes.addAll([0x75, 0x00]);
-      } else if (line.startsWith('JA ')) {
-        // Salto si mayor
-        bytes.addAll([0x77, 0x00]);
-      } else if (line.startsWith('RET')) {
-        // Retorno
-        bytes.add(0xC3);
-      } else if (line.startsWith('XOR ')) {
-        // XOR simplificado
-        bytes.addAll([0x33, 0xC0]);
-      } else if (line.startsWith('INC ')) {
-        // Incremento
-        bytes.add(0x40);
+
+        currentAddress += bytes.length;
+      } catch (e) {
+        print('Error en segunda pasada, línea: $line');
+        print('Error: $e');
       }
     }
 
     return bytes;
-  }
-
-  static int _parseRegister(String reg) {
-    switch (reg.toUpperCase()) {
-      case 'AX':
-        return 0;
-      case 'BX':
-        return 3;
-      case 'CX':
-        return 1;
-      case 'DX':
-        return 2;
-      case 'SI':
-        return 6;
-      case 'DI':
-        return 7;
-      default:
-        return 0;
-    }
   }
 }
